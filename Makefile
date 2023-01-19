@@ -26,6 +26,7 @@ REPO = petsprize-competition
 REGISTRY_IMAGE = petsprize.azurecr.io/${REPO}:${TAG}
 LOCAL_IMAGE = ${REPO}:${LOCAL_TAG}
 CONTAINER_NAME = petsprize
+GITHUB_ACTIONS_NO_TTY = true
 
 # if not TTY (for example GithubActions CI) no interactive tty commands for docker
 ifneq (true, ${GITHUB_ACTIONS_NO_TTY})

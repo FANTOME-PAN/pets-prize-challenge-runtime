@@ -1,7 +1,7 @@
 data/
 submission/
 submission_src/
-
+.idea/
 
 ## https://github.com/github/gitignore/blob/main/Python.gitignore
 
