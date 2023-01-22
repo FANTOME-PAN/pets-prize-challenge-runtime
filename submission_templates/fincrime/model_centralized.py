@@ -407,7 +407,7 @@ class Net_lg(nn.Module):
     def __init__(self):
         super(Net_lg, self).__init__()
         self.layer_1 = nn.Linear(27, 1) 
-        self.sigmoid =  nn.Sigmoid()
+        self.sigmoid = nn.Sigmoid()
         
         
     def forward(self, inputs):

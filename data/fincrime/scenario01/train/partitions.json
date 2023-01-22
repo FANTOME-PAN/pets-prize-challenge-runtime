@@ -7,5 +7,11 @@
     },
     "bank02": {
         "data_path": "bank_dataset.csv"
+    },
+    "bank03": {
+        "data_path": "bank_dataset.csv"
+    },
+    "bank04": {
+        "data_path": "bank_dataset.csv"
     }
 }
