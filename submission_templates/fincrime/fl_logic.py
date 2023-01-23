@@ -110,13 +110,13 @@ class TrainClientTemplate(fl.client.NumPyClient):
         pass
 
     def stage0(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
-        pass
+        return [], 0, {}
 
     def stage1(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
-        pass
+        return [], 0, {}
 
     def stage2(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
-        pass
+        return [], 0, {}
 
     def get_vars(self):
         return vars(self)
