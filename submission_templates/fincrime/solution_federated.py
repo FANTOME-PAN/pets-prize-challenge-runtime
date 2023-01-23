@@ -167,7 +167,7 @@ class TrainSwiftClient(TrainClientTemplate):
                 logger.info(f"reconstructed grad = {str(grad)}")
 
             grad = reverse_quantize([grad], 16, 1 << 24)[0]
-            grad -= len(self.shared_seed_dict) * 16.
+            grad -= (len(self.shared_seed_dict) - 1) * 16.
             self.agg_grad[1:-1] = grad
             if DEBUG:
                 logger.info(f"aggregate grad = {str(self.agg_grad)}")
