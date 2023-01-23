@@ -14,6 +14,7 @@ from .secagg import public_key_to_bytes, bytes_to_public_key, generate_key_pairs
     quantize, reverse_quantize, encrypt, decrypt
 import pickle
 from .fl_logic import TrainClientTemplate
+from .fl_xgboost_utils import fit_swift, test_swift
 
 LOGIC_TEST = True
 DEBUG = True
