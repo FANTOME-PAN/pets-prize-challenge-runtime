@@ -10,16 +10,15 @@ from loguru import logger
 import numpy as np
 import pandas as pd
 # from torch import nn
-from .secagg import public_key_to_bytes, bytes_to_public_key, generate_key_pairs, generate_shared_key, \
-    quantize, reverse_quantize, encrypt, decrypt
+from .secagg import quantize, reverse_quantize, encrypt, decrypt
 import pickle
 from .fl_logic import TrainClientTemplate
 from .fl_xgboost_utils import fit_swift, test_swift
 
-LOGIC_TEST = True
-DEBUG = True
-CLIP_RANGE = 16
-TARGET_RANGE = 1 << 24
+from .settings import DEBUG, LOGIC_TEST
+
+CLIP_RANGE = 64
+TARGET_RANGE = 1 << 27
 
 """=== Utility Functions ==="""
 
@@ -97,7 +96,7 @@ class TrainDataLoader:
             batch_proba = np.zeros(self.batch_size)
         else:
             batch_proba = self.proba[self.ptr: self.ptr + self.batch_size]
-        oa_ba_label = self.df[['OrderingAccount', 'BeneficiaryAccount', 'Label']].values[self.ptr: self.ptr + self.batch_size]
+        oa_ba_label = self.df.values[self.ptr: self.ptr + self.batch_size]
         self.ptr += self.batch_size
         if self.ptr >= len(self.df):
             self.ptr = 0
@@ -107,7 +106,7 @@ class TrainDataLoader:
 
 class TestDataLoader:
     def __init__(self, df: pd.DataFrame):
-        self.df = df
+        self.df = df[['OrderingAccount', 'BeneficiaryAccount']]
         self.proba = None
         self.account2bank = {}
         self.bank2cid = {}
@@ -132,9 +131,9 @@ class TestDataLoader:
         for account in self.account2bank:
             self.account2bank[account] = self.bank2cid[self.account2bank[account]]
 
-    def set_bank2cid(self, bank2cid: Dict[str, str]):
+    def set_bank2cid(self, df: pd.DataFrame, bank2cid: Dict[str, str]):
         self.bank2cid = bank2cid
-        self._build_account2bank_dict(self.df)
+        self._build_account2bank_dict(df)
 
     def set_proba(self, proba: np.ndarray):
         assert proba.shape[0] == len(self.df)
@@ -145,7 +144,7 @@ class TestDataLoader:
     def get_data(self) -> Tuple[np.ndarray, List[Tuple[str, str, str, str]]]:
         if LOGIC_TEST:
             self.proba = np.zeros(len(self.df))
-        oa_ba = self.df[['OrderingAccount', 'BeneficiaryAccount']].values
+        oa_ba = self.df.values
         batch = [(self.account2bank[oa], self.account2bank[ba], oa, ba) for oa, ba in oa_ba]
         return self.proba, batch
 
@@ -205,8 +204,8 @@ class TrainSwiftClient(TrainClientTemplate):
             if DEBUG:
                 logger.info(f"reconstructed grad = {str(grad)}")
 
-            grad = reverse_quantize([grad], 16, 1 << 24)[0]
-            grad -= (len(self.shared_seed_dict) - 1) * 16.
+            grad = reverse_quantize([grad], CLIP_RANGE, TARGET_RANGE)[0]
+            grad -= (len(self.shared_seed_dict) - 1) * CLIP_RANGE
             self.agg_grad[1:-1] = grad
             if DEBUG:
                 logger.info(f"aggregate grad = {str(self.agg_grad)}")
@@ -222,7 +221,7 @@ class TrainSwiftClient(TrainClientTemplate):
         if DEBUG:
             logger.info(f'swift predicted proba: {proba}')
         # wx = w_0 * proba + b, where b = weights[27]
-        wx = quantize([self.weights[0] * proba + self.weights[-1]], 16, 1 << 24)[0]
+        wx = quantize([self.weights[0] * proba + self.weights[-1]], CLIP_RANGE, TARGET_RANGE)[0]
         masked_wx = masking(server_rnd + 1, wx, self.cid, self.shared_seed_dict)
         if DEBUG:
             logger.info(f'client {self.cid}: masking offset = {server_rnd + 1}')
@@ -307,7 +306,7 @@ class TrainBankClient(TrainClientTemplate):
                 self.cached_flags[i][flg + 13] = 1
                 if DEBUG and LOGIC_TEST:
                     logger.info(f'BATCH_IDX: {i} BENEFICIARY_ACCOUNT')
-        ret = quantize([ret], clipping_range=16, target_range=(1 << 24))[0]
+        ret = quantize([ret], CLIP_RANGE, TARGET_RANGE)[0]
         masked_ret = masking(server_rnd, ret, self.cid, self.shared_seed_dict)
         if DEBUG:
             logger.info(f'client {self.cid}: masking offset = {server_rnd}')
@@ -322,7 +321,7 @@ class TrainBankClient(TrainClientTemplate):
         if DEBUG:
             logger.info(f'{self.cached_flags}')
         self.partial_grad = (self.beta.reshape((-1, 1)).repeat(26, axis=1) * self.cached_flags).sum(axis=0)
-        self.partial_grad = quantize([self.partial_grad], 16, 1 << 24)[0]
+        self.partial_grad = quantize([self.partial_grad], CLIP_RANGE, TARGET_RANGE)[0]
         masked_partial_grad = masking(server_rnd, self.partial_grad, self.cid, self.shared_seed_dict)
         if DEBUG:
             logger.info(f'client {self.cid}: uploading masked grad : {masked_partial_grad}')
@@ -510,8 +509,8 @@ class TrainStrategy(fl.server.strategy.Strategy):
                 masked_res = parameters_to_ndarrays(res.parameters)[0]
                 self.logit += masked_res
             self.logit &= 0xffffffff
-            self.logit = reverse_quantize([self.logit], clipping_range=16, target_range=(1 << 24))[0]
-            self.logit -= len(results) * 16.
+            self.logit = reverse_quantize([self.logit], CLIP_RANGE, TARGET_RANGE)[0]
+            self.logit -= len(results) * CLIP_RANGE
             if DEBUG:
                 logger.info(f'server: reconstructed logits = {self.logit}')
                 logger.info(f'server: labels = {self.label}')
@@ -605,13 +604,14 @@ class TestSwiftClient(TrainClientTemplate):
             if DEBUG:
                 logger.info(f'swift client: reading bank list of {cid}, sized {len(lst) - 1}')
             self.bank2cid |= dict(zip(lst[1:], [cid] * (len(lst) - 1)))
-        self.loader.set_bank2cid(self.bank2cid)
+        self.loader.set_bank2cid(self.df, self.bank2cid)
         logger.info("swift client: test XGBoost")
         # training code
         # UNIMPLEMENTED CODE HERE
         if not LOGIC_TEST:
             all_proba = test_swift(self.df, self.client_dir)[1]
             self.loader.set_proba(all_proba)
+        self.df = None
 
     def stage0(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
         logger.info('swift client: preparing data...')
@@ -624,7 +624,7 @@ class TestSwiftClient(TrainClientTemplate):
         if DEBUG:
             logger.info(f'swift predicted proba: {proba}')
         # wx = w_0 * proba + b, where b = weights[27]
-        wx = quantize([self.weights[0] * proba + self.weights[-1]], 16, 1 << 24)[0]
+        wx = quantize([self.weights[0] * proba + self.weights[-1]], CLIP_RANGE, TARGET_RANGE)[0]
         masked_wx = masking(server_rnd + 1, wx, self.cid, self.shared_seed_dict)
         if DEBUG:
             logger.info(f'client {self.cid}: masking offset = {server_rnd + 1}')
@@ -706,7 +706,7 @@ class TestBankClient(TrainClientTemplate):
                 ret[i] += self.weights[flg + 13]
                 if DEBUG:
                     logger.info(f'BATCH_IDX: {i} BENEFICIARY_ACCOUNT')
-        ret = quantize([ret], clipping_range=16, target_range=(1 << 24))[0]
+        ret = quantize([ret], CLIP_RANGE, TARGET_RANGE)[0]
         masked_ret = masking(server_rnd, ret, self.cid, self.shared_seed_dict)
         if DEBUG:
             logger.info(f'client {self.cid}: masking offset = {server_rnd}')
@@ -893,8 +893,8 @@ class TestStrategy(fl.server.strategy.Strategy):
                 masked_res = parameters_to_ndarrays(res.parameters)[0]
                 self.logit += masked_res
             self.logit &= 0xffffffff
-            self.logit = reverse_quantize([self.logit], clipping_range=16, target_range=(1 << 24))[0]
-            self.logit -= len(results) * 16.
+            self.logit = reverse_quantize([self.logit], CLIP_RANGE, TARGET_RANGE)[0]
+            self.logit -= len(results) * CLIP_RANGE
             if DEBUG:
                 logger.info(f'server: reconstructed logits = {self.logit}')
 

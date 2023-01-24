@@ -2,19 +2,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import flwr as fl
-from flwr.common import FitIns, FitRes, Parameters, Scalar, ndarrays_to_parameters, parameters_to_ndarrays
-from flwr.server import ClientManager
-from flwr.server.client_proxy import ClientProxy
 from loguru import logger
 import numpy as np
 import pandas as pd
-import torch
 from .secagg import public_key_to_bytes, bytes_to_public_key, generate_key_pairs, generate_shared_key, \
     quantize, reverse_quantize, encrypt, decrypt, private_key_to_bytes, bytes_to_private_key
 import pickle
-
-LOGIC_TEST = True
-DEBUG = True
+from .settings import DEBUG, LOGIC_TEST
 
 
 def sum_func(x):
@@ -79,13 +73,19 @@ class TrainClientTemplate(fl.client.NumPyClient):
                 config[cid] = public_key_to_bytes(pk)
             config.pop(self.cid)
             t = ([], 0, config)
-            logger.info(f'client {self.cid}: replying {str(config.keys())}')
+            if DEBUG:
+                logger.info(f'client {self.cid}: replying {str(config.keys())}')
+            else:
+                logger.info(f'client {self.cid}: uploading public keys')
             self.setup_round1(parameters, config, t)
             return t
         # rnd 2
         # generate shared secrets
         if rnd == 2:
-            logger.info(f'client {self.cid}: receiving public keys from {str(config.keys())}')
+            if DEBUG:
+                logger.info(f'client {self.cid}: receiving public keys from {str(config.keys())}')
+            else:
+                logger.info(f'client {self.cid}: receiving public keys')
             # logger.info(f'client {self.cid}: keys of secret key dict {str(self.secret_key_dict.keys())}')
             for cid, pk_bytes in config.items():
                 sk = bytes_to_private_key(self.secret_key_dict[cid])
@@ -96,8 +96,8 @@ class TrainClientTemplate(fl.client.NumPyClient):
                 for i in range(0, len(shared_key), 4):
                     seed32 ^= int.from_bytes(shared_key[i:i + 4], 'little')
                 self.shared_seed_dict[cid] = np.array(seed32, dtype=np.int32)
-
-            logger.info(f'client {self.cid}: shared seed {str(self.shared_seed_dict)}')
+            if DEBUG:
+                logger.info(f'client {self.cid}: shared seed {str(self.shared_seed_dict)}')
             t = ([], 0, {})
             self.setup_round2(parameters, config, t)
             self.secret_key_dict = {}

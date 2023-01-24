@@ -7,30 +7,45 @@ from xgboost import XGBClassifier
 #from sklearn.linear_model import LogisticRegression
 #from sklearn.pipeline import Pipeline
 import os
+from loguru import logger
 import pickle
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import os
+import time
 
+
+class Timer:
+    def __init__(self):
+        self.mark = 0
+
+    def tic(self):
+        self.mark = time.time()
+
+    def toc(self):
+        return time.time() - self.mark
 
 
 def pre_process_swift(swift_train, model_dir):
+    t = Timer()
     #pre-processing number 1
     # Hour frequency for each sender
     swift_train["hour"] = swift_train["Timestamp"].dt.hour
     senders = swift_train["Sender"].unique()
     swift_train["sender_hour"] = swift_train["Sender"] + swift_train["hour"].astype(str)
     sender_hour_frequency = {}
+    t.tic()
     for s in senders:
         sender_rows = swift_train[swift_train["Sender"] == s]
         for h in range(24):
             sender_hour_frequency[s + str(h)] = len(sender_rows[sender_rows["hour"] == h])
     swift_train["sender_hour_freq"] = swift_train["sender_hour"].map(sender_hour_frequency)
-    
+    logger.info(f'Test Time 1: {t.toc()}')
     #pre-processing number 2
     currency_freq = {}
     currency_avg = {}
+    t.tic()
     for sc in set(
         list(swift_train["InstructedCurrency"].unique())
     ):
@@ -38,6 +53,7 @@ def pre_process_swift(swift_train, model_dir):
         currency_avg[sc] = swift_train[swift_train["InstructedCurrency"] == sc][
             "InstructedAmount"
         ].mean()
+    logger.info(f'Test Time 2: {t.toc()}')
 
     swift_train["currency_freq"] = swift_train["InstructedCurrency"].map(currency_freq)
     swift_train["currency_amount_average"] = swift_train["InstructedCurrency"].map(currency_avg)
@@ -47,6 +63,7 @@ def pre_process_swift(swift_train, model_dir):
     receiver_currency_freq = {}
     receiver_currency_avg = {}
 
+    t.tic()
     for sc in set(
         list(swift_train["receiver_currency"].unique())
     ):
@@ -54,6 +71,7 @@ def pre_process_swift(swift_train, model_dir):
         receiver_currency_avg[sc] = swift_train[swift_train["receiver_currency"] == sc][
             "InstructedAmount"
         ].mean()
+    logger.info(f'Test Time 3: {t.toc()}')
 
     swift_train["receiver_currency_freq"] = swift_train["receiver_currency"].map(receiver_currency_freq)
     swift_train["receiver_currency_amount_average"] = swift_train["receiver_currency"].map(receiver_currency_avg)
@@ -63,10 +81,12 @@ def pre_process_swift(swift_train, model_dir):
     swift_train["sender_receiver"] = swift_train["Sender"] + swift_train["Receiver"]
     sender_receiver_freq = {}
 
+    t.tic()
     for sr in set(
         list(swift_train["sender_receiver"].unique())
     ):
         sender_receiver_freq[sr] = len(swift_train[swift_train["sender_receiver"] == sr])
+    logger.info(f'Test Time 4: {t.toc()}')
 
     swift_train["sender_receiver_freq"] = swift_train["sender_receiver"].map(sender_receiver_freq)        
 

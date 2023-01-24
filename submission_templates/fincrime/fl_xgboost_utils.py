@@ -64,7 +64,7 @@ def fit_swift(
 
     logger.info("Fit SWIFT XGBoost")
 
-    X_train_swift = get_X_swift(X_train)
+    X_train_swift = X_train
     xgb = XGBClassifier(n_estimators=100, max_depth=7, base_score=0.01,
                         learning_rate=0.1)  # These parameters can be tuned
     xgb.fit(X_train_swift, Y_train)
@@ -122,7 +122,7 @@ def test_swift(swift_data: pd.DataFrame, model_dir: Path):
 
     logger.info("Run SWIFT XGBoost")
 
-    X_test_swift = get_X_swift(X_test)
+    X_test_swift = X_test
     xgb = XGBClassifier(n_estimators=100, max_depth=7, base_score=0.01,
                         learning_rate=0.1)  # These parameters can be tuned
 
