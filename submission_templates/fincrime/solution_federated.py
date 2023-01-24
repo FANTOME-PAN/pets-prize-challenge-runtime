@@ -18,6 +18,8 @@ from .fl_xgboost_utils import fit_swift, test_swift
 
 LOGIC_TEST = True
 DEBUG = True
+CLIP_RANGE = 16
+TARGET_RANGE = 1 << 24
 
 """=== Utility Functions ==="""
 
@@ -49,38 +51,43 @@ def masking(seed_offset, x: np.ndarray, cid, shared_seed_dict: Dict, target_rang
 
 class TrainDataLoader:
     def __init__(self, df: pd.DataFrame, batch_size=32):
-        self.df = df
+        self.df = df[['OrderingAccount', 'BeneficiaryAccount', 'Label']]
         self.proba = None
-        self.account2bank = {}
+        self.account2cid = {}
         self.bank2cid = {}
         self.batch_size = batch_size
+        self.num_entries = 0
         self.ptr = 0
 
     def _build_account2bank_dict(self, df: pd.DataFrame):
-        prv_t = ['UETR', 'Sender', 'Receiver', 'OrderingAccount', 'BeneficiaryAccount']
-        for t in df[['UETR', 'Sender', 'Receiver', 'OrderingAccount',
+        # prv_t = ['UETR', 'Sender', 'Receiver', 'OrderingAccount', 'BeneficiaryAccount']
+        account2bank = self.account2cid
+        for t in df[['Sender', 'Receiver', 'OrderingAccount',
                      'BeneficiaryAccount']].values:
-            uetr, sender, receiver, oa, ba = t
-            if ba in self.account2bank and oa in self.account2bank:
-                prv_t = t
-                continue
-            if uetr == prv_t[0]:
-                assert sender == self.account2bank[ba]
-                logger.info("Multiple individual transaction detected")
-                self.account2bank[ba] = receiver
-            else:
-                self.account2bank[oa] = sender
-                self.account2bank[ba] = receiver
-            prv_t = t
-        for account in self.account2bank:
-            self.account2bank[account] = self.bank2cid[self.account2bank[account]]
+            sender, receiver, oa, ba = t
+            # if ba in self.account2cid and oa in self.account2cid:
+            #     prv_t = t
+            #     continue
+            # if uetr == prv_t[0]:
+            #     assert sender == self.account2cid[ba]
+            #     logger.warning("Multiple individual transaction detected")
+            #     self.account2cid[ba] = receiver
+            # else:
+            #     self.account2cid[oa] = sender
+            #     self.account2cid[ba] = receiver
+            account2bank[oa] = sender
+            account2bank[ba] = receiver
+            # prv_t = t
+        for account in account2bank:
+            self.account2cid[account] = self.bank2cid[account2bank[account]]
 
-    def set_bank2cid(self, bank2cid: Dict[str, str]):
+    def set_bank2cid(self, df: pd.DataFrame, bank2cid: Dict[str, str]):
         self.bank2cid = bank2cid
-        self._build_account2bank_dict(self.df)
+        self._build_account2bank_dict(df)
+        self.num_entries = len(df)
 
     def set_proba(self, proba: np.ndarray):
-        assert proba.shape[0] == len(self.df)
+        assert proba.shape[0] == self.num_entries
         self.proba = proba
 
     # return predicted probabilities of the batch and
@@ -94,7 +101,7 @@ class TrainDataLoader:
         self.ptr += self.batch_size
         if self.ptr >= len(self.df):
             self.ptr = 0
-        batch = [(self.account2bank[oa], self.account2bank[ba], oa, ba) for oa, ba, _ in oa_ba_label]
+        batch = [(self.account2cid[oa], self.account2cid[ba], oa, ba) for oa, ba, _ in oa_ba_label]
         return batch_proba, batch, oa_ba_label[:, -1].astype(int)
 
 
@@ -116,7 +123,7 @@ class TestDataLoader:
                 continue
             if uetr == prv_t[0]:
                 assert sender == self.account2bank[ba]
-                logger.info("Multiple individual transaction detected")
+                logger.warning("Multiple individual transactions in one end-to-end transaction detected")
                 self.account2bank[ba] = receiver
             else:
                 self.account2bank[oa] = sender
@@ -167,13 +174,10 @@ class TrainSwiftClient(TrainClientTemplate):
         if LOGIC_TEST:
             self.weights = np.zeros(28)
         self.loader = TrainDataLoader(df)
-        self.df = df
         self.bank2cid = {}
         self.lr = 0.1
         self.agg_grad = np.zeros(28)
         self.proba = np.array(0)
-        # with open(self.client_dir / 'a.txt', 'r') as f:
-        #     logger.info(f"\nSWIFT: {f.read()} \n")
 
     def _update_weights(self, grad: np.ndarray):
         self.weights -= self.lr * grad
@@ -184,13 +188,14 @@ class TrainSwiftClient(TrainClientTemplate):
             cid = lst[0]
             logger.info(f'swift client: reading bank list of {cid}, sized {len(lst) - 1}')
             self.bank2cid |= dict(zip(lst[1:], [cid] * (len(lst) - 1)))
-        self.loader.set_bank2cid(self.bank2cid)
+        self.loader.set_bank2cid(self.df, self.bank2cid)
         logger.info("swift client: train XGBoost")
         # training code
         # UNIMPLEMENTED CODE HERE
         if not LOGIC_TEST:
             all_proba = fit_swift(self.df, self.client_dir)[1]
             self.loader.set_proba(all_proba)
+        self.df = None
 
     def stage0(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
         # skip the first stage 0
@@ -207,18 +212,20 @@ class TrainSwiftClient(TrainClientTemplate):
                 logger.info(f"aggregate grad = {str(self.agg_grad)}")
             self._update_weights(self.agg_grad)
 
-        logger.info('swift client: preparing batch...')
+        logger.info('swift client: preparing batch and masked vectors...')
         proba, batch, labels = self.loader.next_batch()
         # if LOGIC_TEST:
         #     proba = np.zeros(x.shape[0])
         # else:
         #     proba = predict_proba(self.net, x)
         self.proba = proba
-        logger.info(f'swift predicted proba: {proba}')
+        if DEBUG:
+            logger.info(f'swift predicted proba: {proba}')
         # wx = w_0 * proba + b, where b = weights[27]
         wx = quantize([self.weights[0] * proba + self.weights[-1]], 16, 1 << 24)[0]
         masked_wx = masking(server_rnd + 1, wx, self.cid, self.shared_seed_dict)
-        logger.info(f'client {self.cid}: masking offset = {server_rnd + 1}')
+        if DEBUG:
+            logger.info(f'client {self.cid}: masking offset = {server_rnd + 1}')
         ret_dict = {}
         for i, (sender_cid, receiver_cid, ordering_account, beneficiary_account) in enumerate(batch):
             cipher_oa = encrypt(self.shared_secret_dict[sender_cid],
@@ -255,14 +262,20 @@ class TrainBankClient(TrainClientTemplate):
         else:
             self.account2flag = dict(zip(df['Account'], df['Flags'].astype(int)))
             torch.save(self.account2flag, pth)
-        self.bank_lst = list(df['Bank'].unique())
+        pth = client_dir / 'bank_lst.pkl'
+        if pth.exists():
+            self.bank_lst = torch.load(pth)
+        else:
+            self.bank_lst = list(df['Bank'].unique())
+        self.df = None
 
     def _get_flag(self, account: str):
         return self.account2flag.setdefault(account, 12)
 
     def setup_round1(self, parameters, config, t: Tuple[List[np.ndarray], int, dict]):
         t[0].append(np.array([self.cid] + self.bank_lst, dtype=str))
-        logger.info(f'client {self.cid}: upload bank list of size {len(t[0][0]) - 1}')
+        if DEBUG:
+            logger.info(f'client {self.cid}: upload bank list of size {len(t[0][0]) - 1}')
 
     def stage1(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
         logger.info(f"Client {self.cid}: reading encrypted batch and computing masked results...")
@@ -286,15 +299,18 @@ class TrainBankClient(TrainClientTemplate):
                 flg = self._get_flag(oa)
                 ret[i] += self.weights[flg]
                 self.cached_flags[i][flg] = 1
-                logger.info(f'BATCH_IDX: {i} ORDERING_ACCOUNT')
+                if DEBUG and LOGIC_TEST:
+                    logger.info(f'BATCH_IDX: {i} ORDERING_ACCOUNT')
             if (ba := try_decrypt_and_load(key, cipher_ba)) is not None:
                 flg = self._get_flag(ba)
                 ret[i] += self.weights[flg + 13]
                 self.cached_flags[i][flg + 13] = 1
-                logger.info(f'BATCH_IDX: {i} BENEFICIARY_ACCOUNT')
+                if DEBUG and LOGIC_TEST:
+                    logger.info(f'BATCH_IDX: {i} BENEFICIARY_ACCOUNT')
         ret = quantize([ret], clipping_range=16, target_range=(1 << 24))[0]
         masked_ret = masking(server_rnd, ret, self.cid, self.shared_seed_dict)
-        logger.info(f'client {self.cid}: masking offset = {server_rnd}')
+        if DEBUG:
+            logger.info(f'client {self.cid}: masking offset = {server_rnd}')
         return [masked_ret], 0, {}
 
     def stage2(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
@@ -303,11 +319,15 @@ class TrainBankClient(TrainClientTemplate):
         # reshape beta to B x 1 from B, then expand it to B x 26
         # do element-wise production between expanded beta and cached_flags (dim: B x 26)
         # finally, sum up along axis 0, get results of dim 26, i.e., the partial agg_grad on this client
-        logger.info(f'{self.cached_flags}')
+        if DEBUG:
+            logger.info(f'{self.cached_flags}')
         self.partial_grad = (self.beta.reshape((-1, 1)).repeat(26, axis=1) * self.cached_flags).sum(axis=0)
         self.partial_grad = quantize([self.partial_grad], 16, 1 << 24)[0]
         masked_partial_grad = masking(server_rnd, self.partial_grad, self.cid, self.shared_seed_dict)
-        logger.info(f'client {self.cid}: uploading masked grad : {masked_partial_grad}')
+        if DEBUG:
+            logger.info(f'client {self.cid}: uploading masked grad : {masked_partial_grad}')
+        else:
+            logger.info(f'client {self.cid}: uploading masked gradient')
         return [masked_partial_grad], 0, {}
 
 
@@ -382,7 +402,8 @@ class TrainStrategy(fl.server.strategy.Strategy):
         cid_dict: Dict[str, ClientProxy] = client_manager.all()
         config_dict = {"round": server_round}
         logger.info(f"[START] server round {server_round}")
-        logger.info(f'GPU STATUS: {torch.cuda.is_available()}')
+        if DEBUG:
+            logger.info(f'GPU STATUS: {torch.cuda.is_available()}')
         # rnd 1
         # collect public keys
         if server_round == 1:
@@ -398,8 +419,10 @@ class TrainStrategy(fl.server.strategy.Strategy):
         if server_round == 2:
             # forward public keys to corresponding clients
             logger.info(f"server's forwarding public keys...")
-            for cid in self.fwd_dict:
-                logger.info(f'forward to {cid} {str(self.fwd_dict[cid].keys())}')
+
+            if DEBUG:
+                for cid in self.fwd_dict:
+                    logger.info(f'forward to {cid} {str(self.fwd_dict[cid].keys())}')
             ins_lst = [(
                 proxy,
                 FitIns(parameters=empty_parameters() if proxy.cid != 'swift' else self.cached_banklsts
@@ -426,7 +449,10 @@ class TrainStrategy(fl.server.strategy.Strategy):
             fit_ins = FitIns(parameters=ndarrays_to_parameters([self.weights]), config=config_dict)
             ins_lst = [(proxy, fit_ins) for cid, proxy in cid_dict.items() if cid != 'swift']
         elif self.stage == 2:
-            logger.info(f"stage 2: broadcasting beta to all clients {self.beta}")
+            if DEBUG:
+                logger.info(f"stage 2: broadcasting beta to all clients {self.beta}")
+            else:
+                logger.info(f"stage 2: broadcasting beta to all clients")
             fit_ins = FitIns(parameters=ndarrays_to_parameters([self.beta]), config=config_dict)
             ins_lst = [(proxy, fit_ins) for cid, proxy in cid_dict.items()]
         else:
@@ -474,7 +500,8 @@ class TrainStrategy(fl.server.strategy.Strategy):
                 self.weights = weights
                 # broadcast to all bank clients
                 self.encrypted_batch = results[0][1].metrics
-                logger.info(f"server received encrypted batch:\n {self.encrypted_batch}")
+                if DEBUG:
+                    logger.info(f"server received encrypted batch:\n {self.encrypted_batch}")
             # if server_round == self.num_rnds, do nothing
             pass
         elif self.stage == 1:
@@ -485,8 +512,9 @@ class TrainStrategy(fl.server.strategy.Strategy):
             self.logit &= 0xffffffff
             self.logit = reverse_quantize([self.logit], clipping_range=16, target_range=(1 << 24))[0]
             self.logit -= len(results) * 16.
-            logger.info(f'server: reconstructed logits = {self.logit}')
-            logger.info(f'server: labels = {self.label}')
+            if DEBUG:
+                logger.info(f'server: reconstructed logits = {self.logit}')
+                logger.info(f'server: labels = {self.label}')
 
             tmp = np.exp(-self.logit)
             y_pred = 1. / (1. + tmp)
@@ -503,7 +531,8 @@ class TrainStrategy(fl.server.strategy.Strategy):
                 if client.cid == 'swift':
                     continue
                 t = parameters_to_ndarrays(res.parameters)
-                logger.info(f'server received {t}')
+                if DEBUG:
+                    logger.info(f'server received {t}')
                 self.agg_grad += t[0]
             pass
         else:
@@ -564,7 +593,6 @@ class TestSwiftClient(TrainClientTemplate):
         if LOGIC_TEST:
             self.weights = np.zeros(28)
         self.loader = TestDataLoader(df)
-        self.df = df
         self.bank2cid = {}
         self.proba = np.array(0)
         self.preds_format_path = preds_format_path
@@ -574,7 +602,8 @@ class TestSwiftClient(TrainClientTemplate):
         logger.info("swift client: build bank to cid dict")
         for lst in parameters:
             cid = lst[0]
-            logger.info(f'swift client: reading bank list of {cid}, sized {len(lst) - 1}')
+            if DEBUG:
+                logger.info(f'swift client: reading bank list of {cid}, sized {len(lst) - 1}')
             self.bank2cid |= dict(zip(lst[1:], [cid] * (len(lst) - 1)))
         self.loader.set_bank2cid(self.bank2cid)
         logger.info("swift client: test XGBoost")
@@ -592,11 +621,13 @@ class TestSwiftClient(TrainClientTemplate):
         # else:
         #     proba = predict_proba(self.net, x)
         self.proba = proba
-        logger.info(f'swift predicted proba: {proba}')
+        if DEBUG:
+            logger.info(f'swift predicted proba: {proba}')
         # wx = w_0 * proba + b, where b = weights[27]
         wx = quantize([self.weights[0] * proba + self.weights[-1]], 16, 1 << 24)[0]
         masked_wx = masking(server_rnd + 1, wx, self.cid, self.shared_seed_dict)
-        logger.info(f'client {self.cid}: masking offset = {server_rnd + 1}')
+        if DEBUG:
+            logger.info(f'client {self.cid}: masking offset = {server_rnd + 1}')
         ret_dict = {}
         for i, (sender_cid, receiver_cid, ordering_account, beneficiary_account) in enumerate(batch):
             cipher_oa = encrypt(self.shared_secret_dict[sender_cid],
@@ -643,7 +674,10 @@ class TestBankClient(TrainClientTemplate):
 
     def setup_round1(self, parameters, config, t: Tuple[List[np.ndarray], int, dict]):
         t[0].append(np.array([self.cid] + self.bank_lst, dtype=str))
-        logger.info(f'client {self.cid}: upload bank list of size {len(t[0][0]) - 1}')
+        if DEBUG:
+            logger.info(f'client {self.cid}: upload bank list of size {len(t[0][0]) - 1}')
+        else:
+            logger.info(f'client {self.cid}: upload bank list')
 
     def stage1(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
         logger.info(f"Client {self.cid}: reading encrypted batch and computing masked results...")
@@ -665,14 +699,17 @@ class TestBankClient(TrainClientTemplate):
             if (oa := try_decrypt_and_load(key, cipher_oa)) is not None:
                 flg = self._get_flag(oa)
                 ret[i] += self.weights[flg]
-                logger.info(f'BATCH_IDX: {i} ORDERING_ACCOUNT')
+                if DEBUG:
+                    logger.info(f'BATCH_IDX: {i} ORDERING_ACCOUNT')
             if (ba := try_decrypt_and_load(key, cipher_ba)) is not None:
                 flg = self._get_flag(ba)
                 ret[i] += self.weights[flg + 13]
-                logger.info(f'BATCH_IDX: {i} BENEFICIARY_ACCOUNT')
+                if DEBUG:
+                    logger.info(f'BATCH_IDX: {i} BENEFICIARY_ACCOUNT')
         ret = quantize([ret], clipping_range=16, target_range=(1 << 24))[0]
         masked_ret = masking(server_rnd, ret, self.cid, self.shared_seed_dict)
-        logger.info(f'client {self.cid}: masking offset = {server_rnd}')
+        if DEBUG:
+            logger.info(f'client {self.cid}: masking offset = {server_rnd}')
         return [masked_ret], 0, {}
 
     def stage2(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
@@ -758,7 +795,8 @@ class TestStrategy(fl.server.strategy.Strategy):
         cid_dict: Dict[str, ClientProxy] = client_manager.all()
         config_dict = {"round": server_round}
         logger.info(f"[START] server round {server_round}")
-        logger.info(f'GPU STATUS: {torch.cuda.is_available()}')
+        if DEBUG:
+            logger.info(f'GPU STATUS: {torch.cuda.is_available()}')
         # rnd 1
         # collect public keys
         if server_round == 1:
@@ -774,8 +812,9 @@ class TestStrategy(fl.server.strategy.Strategy):
         if server_round == 2:
             # forward public keys to corresponding clients
             logger.info(f"server's forwarding public keys...")
-            for cid in self.fwd_dict:
-                logger.info(f'forward to {cid} {str(self.fwd_dict[cid].keys())}')
+            if DEBUG:
+                for cid in self.fwd_dict:
+                    logger.info(f'forward to {cid} {str(self.fwd_dict[cid].keys())}')
             ins_lst = [(
                 proxy,
                 FitIns(parameters=empty_parameters() if proxy.cid != 'swift' else self.cached_banklsts
@@ -856,7 +895,8 @@ class TestStrategy(fl.server.strategy.Strategy):
             self.logit &= 0xffffffff
             self.logit = reverse_quantize([self.logit], clipping_range=16, target_range=(1 << 24))[0]
             self.logit -= len(results) * 16.
-            logger.info(f'server: reconstructed logits = {self.logit}')
+            if DEBUG:
+                logger.info(f'server: reconstructed logits = {self.logit}')
 
             tmp = np.exp(-self.logit)
             y_pred = 1. / (1. + tmp)

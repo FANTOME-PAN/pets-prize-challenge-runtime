@@ -27,17 +27,40 @@ def fit_swift(
 
     logger.info("pre-processing the swift dataset")
     swift_train = pre_process_swift(swift_train, model_dir)
+    columns_to_drop = [
+        "UETR",
+        "Sender",
+        "Receiver",
+        "TransactionReference",
+        "OrderingAccount",
+        "OrderingName",
+        "OrderingStreet",
+        "OrderingCountryCityZip",
+        "BeneficiaryAccount",
+        "BeneficiaryName",
+        "BeneficiaryStreet",
+        "BeneficiaryCountryCityZip",
+        "SettlementDate",
+        "SettlementCurrency",
+        "InstructedCurrency",
+        "Timestamp",
+        "sender_hour",
+        "receiver_currency",
+        "sender_receiver",
+    ]
 
-    combine_train = swift_train.reset_index().rename(columns={'index': 'MessageId'})  # Not sure about this line
-    cols = ['SettlementAmount', 'InstructedAmount', 'Label', 'hour',
-            'sender_hour_freq', 'currency_freq', 'currency_amount_average', 'sender_receiver_freq',
-            'receiver_currency_amount_average', 'sender_receiver_freq']
-    combine_train = combine_train[cols]
+    swift_train = swift_train.drop(columns_to_drop, axis=1)
+
+    # combine_train = swift_train.reset_index().rename(columns={'index': 'MessageId'})  # Not sure about this line
+    # cols = ['SettlementAmount', 'InstructedAmount', 'Label', 'hour',
+    #         'sender_hour_freq', 'currency_freq', 'currency_amount_average', 'sender_receiver_freq',
+    #         'receiver_currency_amount_average', 'sender_receiver_freq']
+    # swift_train = swift_train[cols]
     # combine_train = combine_swift_and_bank_new(swift_train, bank_train)
 
     logger.info("Get X_train and Y_train")
-    X_train = transform_and_normalized_X_train(combine_train, model_dir)
-    Y_train = transform_and_normalized_Y(combine_train)
+    X_train = transform_and_normalized_X_train(swift_train, model_dir)
+    Y_train = transform_and_normalized_Y(swift_train)
 
     logger.info("Fit SWIFT XGBoost")
 
@@ -63,15 +86,39 @@ def test_swift(swift_data: pd.DataFrame, model_dir: Path):
     logger.info("pre-processing the swift dataset")
     swift_test = pre_process_swift_test(swift_test, model_dir)
 
-    combine_test = swift_test.reset_index().rename(columns={'index': 'MessageId'})  # Not sure about this line
-    # combine_train = combine_swift_and_bank_new(swift_train, bank_train)
-    cols = ['SettlementAmount', 'InstructedAmount', 'hour', 'sender_hour_freq',
-            'currency_freq', 'currency_amount_average', 'sender_receiver_freq',
-            'receiver_currency_amount_average', 'sender_receiver_freq']
-    combine_test = combine_test[cols]
+    columns_to_drop = [
+        "UETR",
+        "Sender",
+        "Receiver",
+        "TransactionReference",
+        "OrderingAccount",
+        "OrderingName",
+        "OrderingStreet",
+        "OrderingCountryCityZip",
+        "BeneficiaryAccount",
+        "BeneficiaryName",
+        "BeneficiaryStreet",
+        "BeneficiaryCountryCityZip",
+        "SettlementDate",
+        "SettlementCurrency",
+        "InstructedCurrency",
+        "Timestamp",
+        "sender_hour",
+        "receiver_currency",
+        "sender_receiver",
+    ]
+
+    swift_test = swift_test.drop(columns_to_drop, axis=1)
+
+    # combine_test = swift_test.reset_index().rename(columns={'index': 'MessageId'})  # Not sure about this line
+    # # combine_train = combine_swift_and_bank_new(swift_train, bank_train)
+    # cols = ['SettlementAmount', 'InstructedAmount', 'hour', 'sender_hour_freq',
+    #         'currency_freq', 'currency_amount_average', 'sender_receiver_freq',
+    #         'receiver_currency_amount_average', 'sender_receiver_freq']
+    # combine_test = combine_test[cols]
 
     logger.info("Get X_test")
-    X_test = transform_and_normalized_X_test(combine_test, model_dir, if_exist_y=False)
+    X_test = transform_and_normalized_X_test(swift_test, model_dir, if_exist_y=False)
 
     logger.info("Run SWIFT XGBoost")
 
