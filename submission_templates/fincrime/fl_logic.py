@@ -1,14 +1,15 @@
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
-
+from flwr.common import Scalar
 import flwr as fl
 from loguru import logger
 import numpy as np
 import pandas as pd
 from .secagg import public_key_to_bytes, bytes_to_public_key, generate_key_pairs, generate_shared_key, \
-    quantize, reverse_quantize, encrypt, decrypt, private_key_to_bytes, bytes_to_private_key
+    private_key_to_bytes, bytes_to_private_key
 import pickle
 from .settings import DEBUG, LOGIC_TEST
+from .fl_utils import ndarrays_to_param_bytes
 
 
 def sum_func(x):
@@ -20,11 +21,11 @@ class TrainClientTemplate(fl.client.NumPyClient):
     """Custom Flower NumPyClient class for training."""
 
     def __init__(
-            self, cid: str, df: pd.DataFrame, model, client_dir: Path
+            self, cid: str, df_pth: Path, model, client_dir: Path
     ):
         super().__init__()
         self.cid = cid
-        self.df = df
+        self.df_pth = df_pth
         self.model = model
         self.client_dir = client_dir
         self.cache_pth = client_dir / 'cache.pkl'
@@ -136,9 +137,8 @@ class TrainClientTemplate(fl.client.NumPyClient):
                 self.__dict__.update(pickle.load(f))
             # self.__dict__.update(torch.load(self.cache_pth))
 
-    def fit(
-            self, parameters: List[np.ndarray], config: dict
-    ) -> Tuple[List[np.ndarray], int, dict]:
+    def __execute(self, parameters: List[np.ndarray], config: Dict[str, Scalar]) \
+            -> Tuple[List[np.ndarray], int, dict]:
         rnd = config.pop('round')
         if rnd > 1:
             self.reload()
@@ -161,6 +161,7 @@ class TrainClientTemplate(fl.client.NumPyClient):
             ret = self.stage0(rnd, parameters, config)
             if 'stop' in config:
                 logger.info('swift client: stop signal is detected. abort federated training')
+                ret = ([], 0, {})
         # stage 1
         # BANK ONLY, reply with masked wx
         elif self.stage == 1:
@@ -173,5 +174,17 @@ class TrainClientTemplate(fl.client.NumPyClient):
 
         self.cache()
         return ret
+
+    def fit(
+            self, parameters: List[np.ndarray], config: dict
+    ) -> Tuple[List[np.ndarray], int, dict]:
+        return self.__execute(parameters, config)
+
+    def evaluate(
+        self, parameters: List[np.ndarray], config: Dict[str, Scalar]
+    ) -> Tuple[float, int, Dict[str, Scalar]]:
+        params, num, metrics = self.__execute(parameters, config)
+        metrics['parameters'] = ndarrays_to_param_bytes(params)
+        return 0., num, metrics
 
 

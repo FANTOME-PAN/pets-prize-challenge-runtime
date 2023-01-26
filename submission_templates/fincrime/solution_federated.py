@@ -1,34 +1,48 @@
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Set
 
 import flwr as fl
 import torch
-from flwr.common import FitIns, FitRes, Parameters, Scalar, ndarrays_to_parameters, parameters_to_ndarrays
+from flwr.common import FitIns, FitRes, Parameters, Scalar, ndarrays_to_parameters, parameters_to_ndarrays, \
+    EvaluateIns, EvaluateRes
 from flwr.server import ClientManager
 from flwr.server.client_proxy import ClientProxy
 from loguru import logger
 import numpy as np
 import pandas as pd
-# from torch import nn
+from torch import nn
 from .secagg import quantize, reverse_quantize, encrypt, decrypt
 import pickle
 from .fl_logic import TrainClientTemplate
 from .fl_xgboost_utils import fit_swift, test_swift
-
+from .fl_utils import pyobj2bytes, bytes2pyobj, bytes_to_ndarrays
 from .settings import DEBUG, LOGIC_TEST
+import time
 
+
+class Timer:
+    def __init__(self):
+        self.mark = 0
+        self.toc_cnt = 0
+
+    def tic(self):
+        self.mark = time.time()
+
+    def toc(self):
+        return time.time() - self.mark
+
+
+timer = Timer()
+
+# num_rounds = 1 + 1.5N + 0.5 = 1.5(N+1)
+REAL_ROUNDS = 201  # odd
+TRAINING_ROUNDS = int((REAL_ROUNDS + 1) * 3 // 2)
+LEARNING_RATE = 1.0
+BATCH_SIZE = 2048
 CLIP_RANGE = 64
 TARGET_RANGE = 1 << 27
 
 """=== Utility Functions ==="""
-
-
-def pyobj2bytes(obj: object) -> bytes:
-    return pickle.dumps(obj)
-
-
-def bytes2pyobj(b: bytes) -> object:
-    return pickle.loads(b)
 
 
 def empty_parameters() -> Parameters:
@@ -49,91 +63,94 @@ def masking(seed_offset, x: np.ndarray, cid, shared_seed_dict: Dict, target_rang
 
 
 class TrainDataLoader:
-    def __init__(self, df: pd.DataFrame, batch_size=32):
-        self.df = df[['OrderingAccount', 'BeneficiaryAccount', 'Label']]
+    def __init__(self, batch_size=BATCH_SIZE):
+        self.df: pd.DataFrame = None
         self.proba = None
         self.account2cid = {}
-        self.bank2cid = {}
+        self.bank2cid: List[Tuple[set, str]] = []
         self.batch_size = batch_size
-        self.num_entries = 0
         self.ptr = 0
 
     def _build_account2bank_dict(self, df: pd.DataFrame):
-        # prv_t = ['UETR', 'Sender', 'Receiver', 'OrderingAccount', 'BeneficiaryAccount']
-        account2bank = self.account2cid
+        bank2cid = self.bank2cid
+        # logger.info(f'Bank 2 cid:\n{str(bank2cid)}')
+        for bankset, cid in bank2cid:
+            logger.info(f'{cid}, set of size {len(bankset)}')
+
+        def pick(bank):
+            bank = str(bank)
+            for bankset, cid in bank2cid:
+                if bank in bankset:
+                    return cid
+            logger.info(f'{bank}: Bank name not found')
+            return 'missing'
+
         for t in df[['Sender', 'Receiver', 'OrderingAccount',
                      'BeneficiaryAccount']].values:
             sender, receiver, oa, ba = t
-            # if ba in self.account2cid and oa in self.account2cid:
-            #     prv_t = t
-            #     continue
-            # if uetr == prv_t[0]:
-            #     assert sender == self.account2cid[ba]
-            #     logger.warning("Multiple individual transaction detected")
-            #     self.account2cid[ba] = receiver
-            # else:
-            #     self.account2cid[oa] = sender
-            #     self.account2cid[ba] = receiver
-            account2bank[oa] = sender
-            account2bank[ba] = receiver
-            # prv_t = t
-        for account in account2bank:
-            self.account2cid[account] = self.bank2cid[account2bank[account]]
+            self.account2cid[oa] = pick(sender)
+            self.account2cid[ba] = pick(receiver)
 
-    def set_bank2cid(self, df: pd.DataFrame, bank2cid: Dict[str, str]):
+    def set(self, df: pd.DataFrame, bank2cid: List[Tuple[set, str]]):
         self.bank2cid = bank2cid
         self._build_account2bank_dict(df)
-        self.num_entries = len(df)
+        df = df[['OrderingAccount', 'BeneficiaryAccount', 'Label']]
+        df = df.reset_index()
+        self.df = df[['OrderingAccount', 'BeneficiaryAccount', 'Label']]
+
+    def shuffle(self):
+        self.ptr = 0
+        idx = np.random.permutation(self.df.index)
+        self.proba = self.proba[idx]
+        self.df = self.df.iloc[idx]
 
     def set_proba(self, proba: np.ndarray):
-        assert proba.shape[0] == self.num_entries
+        assert proba.shape[0] == len(self.df)
         self.proba = proba
 
     # return predicted probabilities of the batch and
     # bathed (sender_client_cid, receiver_client_cid, ordering_account, beneficiary_account) and labels
     def next_batch(self) -> Tuple[np.ndarray, List[Tuple[str, str, str, str]], np.ndarray]:
-        if LOGIC_TEST:
-            batch_proba = np.zeros(self.batch_size)
-        else:
-            batch_proba = self.proba[self.ptr: self.ptr + self.batch_size]
+        batch_proba = self.proba[self.ptr: self.ptr + self.batch_size]
         oa_ba_label = self.df.values[self.ptr: self.ptr + self.batch_size]
         self.ptr += self.batch_size
         if self.ptr >= len(self.df):
-            self.ptr = 0
+            self.shuffle()
         batch = [(self.account2cid[oa], self.account2cid[ba], oa, ba) for oa, ba, _ in oa_ba_label]
         return batch_proba, batch, oa_ba_label[:, -1].astype(int)
 
 
 class TestDataLoader:
-    def __init__(self, df: pd.DataFrame):
-        self.df = df[['OrderingAccount', 'BeneficiaryAccount']]
+    def __init__(self):
+        self.df: pd.DataFrame = None
         self.proba = None
-        self.account2bank = {}
-        self.bank2cid = {}
+        self.account2cid = {}
+        self.bank2cid: List[Tuple[set, str]] = []
         self.ptr = 0
 
     def _build_account2bank_dict(self, df: pd.DataFrame):
-        prv_t = ['UETR', 'Sender', 'Receiver', 'OrderingAccount', 'BeneficiaryAccount']
-        for t in df[['UETR', 'Sender', 'Receiver', 'OrderingAccount',
-                     'BeneficiaryAccount']].values:
-            uetr, sender, receiver, oa, ba = t
-            if ba in self.account2bank and oa in self.account2bank:
-                prv_t = t
-                continue
-            if uetr == prv_t[0]:
-                assert sender == self.account2bank[ba]
-                logger.warning("Multiple individual transactions in one end-to-end transaction detected")
-                self.account2bank[ba] = receiver
-            else:
-                self.account2bank[oa] = sender
-                self.account2bank[ba] = receiver
-            prv_t = t
-        for account in self.account2bank:
-            self.account2bank[account] = self.bank2cid[self.account2bank[account]]
+        bank2cid = self.bank2cid
 
-    def set_bank2cid(self, df: pd.DataFrame, bank2cid: Dict[str, str]):
+        def pick(bank):
+            bank = str(bank)
+            for bankset, cid in bank2cid:
+                if bank in bankset:
+                    return cid
+            logger.info(f'{bank}: Bank name not found')
+            return 'missing'
+
+        for t in df[['Sender', 'Receiver', 'OrderingAccount',
+                     'BeneficiaryAccount']].values:
+            sender, receiver, oa, ba = t
+            self.account2cid[oa] = pick(sender)
+            self.account2cid[ba] = pick(receiver)
+
+    def set(self, df: pd.DataFrame, bank2cid: List[Tuple[set, str]]):
         self.bank2cid = bank2cid
         self._build_account2bank_dict(df)
+        df = df[['OrderingAccount', 'BeneficiaryAccount']]
+        df = df.reset_index()
+        self.df = df[['OrderingAccount', 'BeneficiaryAccount']]
 
     def set_proba(self, proba: np.ndarray):
         assert proba.shape[0] == len(self.df)
@@ -145,7 +162,7 @@ class TestDataLoader:
         if LOGIC_TEST:
             self.proba = np.zeros(len(self.df))
         oa_ba = self.df.values
-        batch = [(self.account2bank[oa], self.account2bank[ba], oa, ba) for oa, ba in oa_ba]
+        batch = [(self.account2cid[oa], self.account2cid[ba], oa, ba) for oa, ba in oa_ba]
         return self.proba, batch
 
 
@@ -165,16 +182,17 @@ class TrainSwiftClient(TrainClientTemplate):
     """Custom Flower NumPyClient class for training."""
 
     def __init__(
-            self, cid: str, df: pd.DataFrame, model, client_dir: Path
+            self, cid: str, df_pth: Path, model, client_dir: Path
     ):
-        super().__init__(cid, df, model, client_dir)
+        # df = df.sample(frac=1)
+        super().__init__(cid, df_pth, model, client_dir)
         # UNIMPLEMENTED CODE HERE
         self.weights = np.random.rand(28)
         if LOGIC_TEST:
             self.weights = np.zeros(28)
-        self.loader = TrainDataLoader(df)
-        self.bank2cid = {}
-        self.lr = 0.1
+        self.loader = TrainDataLoader()
+        self.bank2cid = []
+        self.lr = LEARNING_RATE
         self.agg_grad = np.zeros(28)
         self.proba = np.array(0)
 
@@ -183,18 +201,23 @@ class TrainSwiftClient(TrainClientTemplate):
 
     def setup_round2(self, parameters, config, t: Tuple[List[np.ndarray], int, dict]):
         logger.info("swift client: build bank to cid dict")
-        for lst in parameters:
-            cid = lst[0]
-            logger.info(f'swift client: reading bank list of {cid}, sized {len(lst) - 1}')
-            self.bank2cid |= dict(zip(lst[1:], [cid] * (len(lst) - 1)))
-        self.loader.set_bank2cid(self.df, self.bank2cid)
+        # for lst in parameters:
+        #     cid = lst[0]
+        #     logger.info(f'swift client: reading bank list of {cid}, sized {len(lst) - 1}')
+        #     self.bank2cid |= dict(zip(lst[1:], [cid] * (len(lst) - 1)))
+        self.bank2cid = [(set(lst[1:]), lst[0]) for lst in parameters]
+        df = pd.read_csv(self.df_pth, index_col='MessageId')
+        self.loader.set(df, self.bank2cid)
         logger.info("swift client: train XGBoost")
         # training code
         # UNIMPLEMENTED CODE HERE
         if not LOGIC_TEST:
-            all_proba = fit_swift(self.df, self.client_dir)[1]
+            # self.loader.set_proba(np.zeros(len(df)))
+            all_proba = fit_swift(df, self.client_dir)[1]
             self.loader.set_proba(all_proba)
-        self.df = None
+        else:
+            self.loader.set_proba(np.zeros(len(df)))
+        self.loader.shuffle()
 
     def stage0(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
         # skip the first stage 0
@@ -207,6 +230,9 @@ class TrainSwiftClient(TrainClientTemplate):
             grad = reverse_quantize([grad], CLIP_RANGE, TARGET_RANGE)[0]
             grad -= (len(self.shared_seed_dict) - 1) * CLIP_RANGE
             self.agg_grad[1:-1] = grad
+            # reduction = mean
+            self.agg_grad /= self.loader.batch_size
+            self.agg_grad = -self.agg_grad
             if DEBUG:
                 logger.info(f"aggregate grad = {str(self.agg_grad)}")
             self._update_weights(self.agg_grad)
@@ -226,14 +252,36 @@ class TrainSwiftClient(TrainClientTemplate):
         if DEBUG:
             logger.info(f'client {self.cid}: masking offset = {server_rnd + 1}')
         ret_dict = {}
+        if DEBUG:
+            timer.tic()
+        first_cid = None
+        for first_cid in self.shared_secret_dict:
+            break
         for i, (sender_cid, receiver_cid, ordering_account, beneficiary_account) in enumerate(batch):
-            cipher_oa = encrypt(self.shared_secret_dict[sender_cid],
+            if sender_cid == 'missing':
+                if DEBUG:
+                    logger.info(f'swift client: OrderingAccount {ordering_account} belongs to a missing bank.'
+                                f' send to client {first_cid} instead')
+                oa_seed = self.shared_secret_dict[first_cid]
+            else:
+                oa_seed = self.shared_secret_dict[sender_cid]
+
+            if receiver_cid == 'missing':
+                if DEBUG:
+                    logger.info(f'swift client: BeneficiaryAccount {beneficiary_account} belongs to a missing bank.'
+                                f' send to client {first_cid} instead')
+                ba_seed = self.shared_secret_dict[first_cid]
+            else:
+                ba_seed = self.shared_secret_dict[receiver_cid]
+
+            cipher_oa = encrypt(oa_seed,
                                 pyobj2bytes(ordering_account))
-            cipher_ba = encrypt(self.shared_secret_dict[receiver_cid],
+            cipher_ba = encrypt(ba_seed,
                                 pyobj2bytes(beneficiary_account))
             t = (cipher_oa, cipher_ba)
             ret_dict[str(i)] = pyobj2bytes(t)
-
+        if DEBUG:
+            logger.info(f'Encryption time: {timer.toc()}')
         # UNIMPLEMENTED CODE HERE
         # labels = x[:, -1].astype(int)
         return [masked_wx, self.weights[1:-1], labels], 0, ret_dict
@@ -250,29 +298,20 @@ class TrainBankClient(TrainClientTemplate):
     """Custom Flower NumPyClient class for training."""
 
     def __init__(
-            self, cid: str, df: pd.DataFrame, client_dir: Path
+            self, cid: str, df_pth: Path, client_dir: Path
     ):
-        super().__init__(cid, df, None, client_dir)
+        super().__init__(cid, df_pth, None, client_dir)
         self.weights = np.array(0)
         self.cached_flags = np.array(0)
-        pth = client_dir / 'account2flag.pkl'
-        if pth.exists():
-            self.account2flag = torch.load(pth)
-        else:
-            self.account2flag = dict(zip(df['Account'], df['Flags'].astype(int)))
-            torch.save(self.account2flag, pth)
-        pth = client_dir / 'bank_lst.pkl'
-        if pth.exists():
-            self.bank_lst = torch.load(pth)
-        else:
-            self.bank_lst = list(df['Bank'].unique())
-        self.df = None
+        self.account2flag = None
 
     def _get_flag(self, account: str):
         return self.account2flag.setdefault(account, 12)
 
     def setup_round1(self, parameters, config, t: Tuple[List[np.ndarray], int, dict]):
-        t[0].append(np.array([self.cid] + self.bank_lst, dtype=str))
+        df = pd.read_csv(self.df_pth, dtype=pd.StringDtype())
+        self.account2flag = dict(zip(df['Account'], df['Flags'].astype(int)))
+        t[0].append(np.array([self.cid] + list(df['Bank'].unique()), dtype=str))
         if DEBUG:
             logger.info(f'client {self.cid}: upload bank list of size {len(t[0][0]) - 1}')
 
@@ -290,6 +329,8 @@ class TrainBankClient(TrainClientTemplate):
         # w2 = weights[:13], w3 = weights[13:]
         # x2, x3 is the one-hot encoding of OA flag, BA flag
         self.cached_flags = np.zeros((len(config), 26))
+        if DEBUG:
+            timer.tic()
         for str_i, obj_bytes in config.items():
             # logger.info(f'try decrypting {obj_bytes} of type {type(obj_bytes)}')
             cipher_oa, cipher_ba = bytes2pyobj(obj_bytes)
@@ -306,6 +347,8 @@ class TrainBankClient(TrainClientTemplate):
                 self.cached_flags[i][flg + 13] = 1
                 if DEBUG and LOGIC_TEST:
                     logger.info(f'BATCH_IDX: {i} BENEFICIARY_ACCOUNT')
+        if DEBUG:
+            logger.info(f'Decryption time: {timer.toc()}')
         ret = quantize([ret], CLIP_RANGE, TARGET_RANGE)[0]
         masked_ret = masking(server_rnd, ret, self.cid, self.shared_seed_dict)
         if DEBUG:
@@ -318,7 +361,7 @@ class TrainBankClient(TrainClientTemplate):
         # reshape beta to B x 1 from B, then expand it to B x 26
         # do element-wise production between expanded beta and cached_flags (dim: B x 26)
         # finally, sum up along axis 0, get results of dim 26, i.e., the partial agg_grad on this client
-        if DEBUG:
+        if DEBUG and LOGIC_TEST:
             logger.info(f'{self.cached_flags}')
         self.partial_grad = (self.beta.reshape((-1, 1)).repeat(26, axis=1) * self.cached_flags).sum(axis=0)
         self.partial_grad = quantize([self.partial_grad], CLIP_RANGE, TARGET_RANGE)[0]
@@ -353,16 +396,13 @@ def train_client_factory(
     """
     if cid == "swift":
         logger.info("Initializing SWIFT client for {}", cid)
-        swift_df = pd.read_csv(data_path, index_col="MessageId")
-        # UNIMPLEMENTED CODE HERE
         return TrainSwiftClient(
-            cid, df=swift_df, model=None, client_dir=client_dir
+            cid, df_pth=data_path, model=None, client_dir=client_dir
         )
     else:
         logger.info("Initializing bank client for {}", cid)
-        bank_df = pd.read_csv(data_path, dtype=pd.StringDtype())
         return TrainBankClient(
-            cid, df=bank_df, client_dir=client_dir
+            cid, df_pth=data_path, client_dir=client_dir
         )
 
 
@@ -378,25 +418,26 @@ class TrainStrategy(fl.server.strategy.Strategy):
         self.fwd_dict = {}
         self.agg_grad = np.zeros(26)
         self.stage = 0
-        self.num_rnds = num_rounds
+        self.num_rnds = TRAINING_ROUNDS << 1
         self.label = np.array(0)
         self.weights = np.array(0)
         self.logit = np.array(0)
         self.beta = np.array(0)
         self.encrypted_batch: Dict[str, bytes] = {}
         self.cached_banklsts = []
+        self.rnd_cnt = 0
         super().__init__()
 
     def initialize_parameters(self, client_manager: ClientManager) -> Parameters:
         """Do nothing. Return empty Flower Parameters dataclass."""
         return empty_parameters()
 
-    def configure_fit(
+    def __configure_round(
             self,
             server_round: int,
             parameters: Parameters,
-            client_manager: ClientManager
-    ) -> List[Tuple[ClientProxy, FitIns]]:
+            client_manager: ClientManager,
+    ) -> List[Tuple[ClientProxy, Union[FitIns]]]:
         """Configure the next round of training."""
         cid_dict: Dict[str, ClientProxy] = client_manager.all()
         config_dict = {"round": server_round}
@@ -409,7 +450,7 @@ class TrainStrategy(fl.server.strategy.Strategy):
             # add all cids to the config_dict as keys
             config_dict = dict(zip(cid_dict.keys(), [0] * len(cid_dict))) | config_dict
             logger.info(f"server's requesting public keys...")
-            if DEBUG:
+            if DEBUG and LOGIC_TEST:
                 logger.info(f"send to clients {str(config_dict)}")
             fit_ins = FitIns(parameters=empty_parameters(), config=config_dict)
             return [(o, fit_ins) for o in cid_dict.values()]
@@ -427,7 +468,7 @@ class TrainStrategy(fl.server.strategy.Strategy):
                 FitIns(parameters=empty_parameters() if proxy.cid != 'swift' else self.cached_banklsts
                        , config=self.fwd_dict[cid] | config_dict)
             ) for cid, proxy in cid_dict.items()]
-            if DEBUG:
+            if DEBUG and LOGIC_TEST:
                 logger.info(f"server's sending to swift bank lists {str(parameters_to_ndarrays(self.cached_banklsts))}")
             self.cached_banklsts = []
             self.fwd_dict = {}
@@ -459,13 +500,12 @@ class TrainStrategy(fl.server.strategy.Strategy):
 
         return ins_lst
 
-    def aggregate_fit(
+    def __aggregate_round(
             self,
             server_round: int,
             results: List[Tuple[ClientProxy, FitRes]],
             failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
     ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
-        """Aggregate training results."""
         if (n_failures := len(failures)) > 0:
             logger.error(f"Had {n_failures} failures in round {server_round}")
             raise Exception(f"Had {n_failures} failures in round {server_round}")
@@ -495,11 +535,12 @@ class TrainStrategy(fl.server.strategy.Strategy):
             if server_round < self.num_rnds:
                 masked_wx, weights, label = parameters_to_ndarrays(results[0][1].parameters)
                 self.logit = masked_wx
+                logger.info(f"logit type {type(self.logit)}, dtype {self.logit.dtype}")
                 self.label = label
                 self.weights = weights
                 # broadcast to all bank clients
                 self.encrypted_batch = results[0][1].metrics
-                if DEBUG:
+                if DEBUG and LOGIC_TEST:
                     logger.info(f"server received encrypted batch:\n {self.encrypted_batch}")
             # if server_round == self.num_rnds, do nothing
             pass
@@ -508,6 +549,8 @@ class TrainStrategy(fl.server.strategy.Strategy):
             for proxy, res in results:
                 masked_res = parameters_to_ndarrays(res.parameters)[0]
                 self.logit += masked_res
+                logger.info(f"logit type {type(self.logit)}, dtype {self.logit.dtype}")
+                logger.info(f"masked_res type {type(masked_res)}, dtype {masked_res.dtype}")
             self.logit &= 0xffffffff
             self.logit = reverse_quantize([self.logit], CLIP_RANGE, TARGET_RANGE)[0]
             self.logit -= len(results) * CLIP_RANGE
@@ -515,13 +558,24 @@ class TrainStrategy(fl.server.strategy.Strategy):
                 logger.info(f'server: reconstructed logits = {self.logit}')
                 logger.info(f'server: labels = {self.label}')
 
-            tmp = np.exp(-self.logit)
-            y_pred = 1. / (1. + tmp)
+            y_pred = np.zeros(len(self.logit), dtype=np.float64)
+            msk = self.logit >= 0
+            y_pred[msk] = 1. / (1. + np.exp(-self.logit[msk]))
+            e_logit = np.exp(self.logit[~msk])
+            y_pred[~msk] = e_logit / (1. + e_logit)
+            # y_pred = 1. / (1. + tmp)
+            if DEBUG:
+                logger.info(f'server: preds = {y_pred}')
+            # loss = nn.BCELoss()(y_pred, self.label)
+            y = self.label
+            loss = -((1 - y) * np.log(1. - y_pred) + y * np.log(y_pred)).mean()
+            logger.info(f'BCE loss: {loss}')
             beta = np.zeros(len(self.encrypted_batch))
+            exp_minus_logit = np.exp(-self.logit)
             msk = (self.label == 1)
-            beta[msk] = 1. + tmp[msk]
+            beta[msk] = 1. + exp_minus_logit[msk]
             beta[~msk] = 1. / (y_pred[~msk] - 1.)
-            beta *= (tmp * y_pred * y_pred)
+            beta *= (exp_minus_logit * y_pred * y_pred)
             self.beta = beta
             pass
         elif self.stage == 2:
@@ -539,13 +593,48 @@ class TrainStrategy(fl.server.strategy.Strategy):
         self.stage = (self.stage + 1) % 3
         return None, {}
 
-    def configure_evaluate(self, server_round, parameters, client_manager):
-        """Not running any federated evaluation."""
-        return []
+    def configure_fit(
+            self,
+            server_round: int,
+            parameters: Parameters,
+            client_manager: ClientManager
+    ) -> List[Tuple[ClientProxy, FitIns]]:
+        """Configure the next round of training."""
+        self.rnd_cnt += 1
+        return self.__configure_round(self.rnd_cnt, parameters, client_manager)
 
-    def aggregate_evaluate(self, server_round, results, failures):
-        """Not aggregating any evaluation."""
-        return None
+    def aggregate_fit(
+            self,
+            server_round: int,
+            results: List[Tuple[ClientProxy, FitRes]],
+            failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
+    ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
+        """Aggregate training results."""
+        return self.__aggregate_round(self.rnd_cnt, results, failures)
+
+    def configure_evaluate(
+            self,
+            server_round: int,
+            parameters: Parameters,
+            client_manager: ClientManager
+    ) -> List[Tuple[ClientProxy, EvaluateIns]]:
+        self.rnd_cnt += 1
+        ins_lst = self.__configure_round(self.rnd_cnt, parameters, client_manager)
+        return [(proxy, EvaluateIns(ins.parameters, ins.config)) for proxy, ins in ins_lst]
+
+    def aggregate_evaluate(
+            self,
+            server_round: int,
+            results: List[Tuple[ClientProxy, EvaluateRes]],
+            failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
+    ) -> Tuple[Optional[float], Dict[str, Scalar]]:
+
+        def convert(res: EvaluateRes) -> FitRes:
+            params = bytes2pyobj(res.metrics.pop('parameters'))
+            return FitRes(res.status, params, res.num_examples, res.metrics)
+
+        results = [(proxy, convert(eval_res)) for proxy, eval_res in results]
+        return self.__aggregate_round(self.rnd_cnt, results, failures)
 
     def evaluate(self, server_round, parameters):
         """Not running any centralized evaluation."""
@@ -570,48 +659,50 @@ def train_strategy_factory(
         (Strategy): Instance of Flower Strategy.
         (int): Number of federated learning rounds to execute.
     """
-    # num_rounds of setup phase = 2
-    # num_rounds of one training round = 3 (stage 0,1,2)
-    # end round, end at stage 0
-    # num_rounds = 2 + 3N + 1 = 3 + 3N
-    num_rounds = 6
+    # num_rounds of setup phase = 2 / 2 = 1
+    # num_rounds of one training round = 3 / 2 = 1.5 (stage 0,1,2)
+    # end round, end at stage 0, i.e., 0.5 round
+    # num_rounds = 1 + 1.5N + 0.5 = 1.5(N+1)
+    num_rounds = TRAINING_ROUNDS
     training_strategy = TrainStrategy(server_dir=server_dir, num_rounds=num_rounds)
     return training_strategy, num_rounds
 
 
 class TestSwiftClient(TrainClientTemplate):
     """Custom Flower NumPyClient class for test."""
+
     def __init__(
-            self, cid: str, df: pd.DataFrame, client_dir: Path,
+            self, cid: str, df_pth: Path, client_dir: Path,
             preds_format_path: Path,
             preds_dest_path: Path,
     ):
-        super().__init__(cid, df, None, client_dir)
+        super().__init__(cid, df_pth, None, client_dir)
         # UNIMPLEMENTED CODE HERE
         self.weights = np.random.rand(28)
         if LOGIC_TEST:
             self.weights = np.zeros(28)
-        self.loader = TestDataLoader(df)
-        self.bank2cid = {}
+        self.loader = TestDataLoader()
+        self.bank2cid: List[Tuple[Set[str], str]] = []
         self.proba = np.array(0)
         self.preds_format_path = preds_format_path
         self.preds_dest_path = preds_dest_path
+        self.index = None
 
     def setup_round2(self, parameters, config, t: Tuple[List[np.ndarray], int, dict]):
         logger.info("swift client: build bank to cid dict")
-        for lst in parameters:
-            cid = lst[0]
-            if DEBUG:
-                logger.info(f'swift client: reading bank list of {cid}, sized {len(lst) - 1}')
-            self.bank2cid |= dict(zip(lst[1:], [cid] * (len(lst) - 1)))
-        self.loader.set_bank2cid(self.df, self.bank2cid)
+        self.bank2cid = [(set(lst[1:]), lst[0]) for lst in parameters]
+        df = pd.read_csv(self.df_pth, index_col='MessageId')
+        self.index = df.index
+        self.loader.set(df, self.bank2cid)
         logger.info("swift client: test XGBoost")
         # training code
         # UNIMPLEMENTED CODE HERE
         if not LOGIC_TEST:
-            all_proba = test_swift(self.df, self.client_dir)[1]
+            # self.loader.set_proba(np.zeros(len(df)))
+            all_proba = test_swift(df, self.client_dir)[1]
             self.loader.set_proba(all_proba)
-        self.df = None
+        else:
+            self.loader.set_proba(np.zeros(len(df)))
 
     def stage0(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
         logger.info('swift client: preparing data...')
@@ -629,10 +720,29 @@ class TestSwiftClient(TrainClientTemplate):
         if DEBUG:
             logger.info(f'client {self.cid}: masking offset = {server_rnd + 1}')
         ret_dict = {}
+        first_cid = None
+        for first_cid in self.shared_secret_dict:
+            break
         for i, (sender_cid, receiver_cid, ordering_account, beneficiary_account) in enumerate(batch):
-            cipher_oa = encrypt(self.shared_secret_dict[sender_cid],
+            if sender_cid == 'missing':
+                if DEBUG:
+                    logger.info(f'swift client: OrderingAccount {ordering_account} belongs to a missing bank.'
+                                f' send to client {first_cid} instead')
+                oa_seed = self.shared_secret_dict[first_cid]
+            else:
+                oa_seed = self.shared_secret_dict[sender_cid]
+
+            if receiver_cid == 'missing':
+                if DEBUG:
+                    logger.info(f'swift client: BeneficiaryAccount {beneficiary_account} belongs to a missing bank.'
+                                f' send to client {first_cid} instead')
+                ba_seed = self.shared_secret_dict[first_cid]
+            else:
+                ba_seed = self.shared_secret_dict[receiver_cid]
+
+            cipher_oa = encrypt(oa_seed,
                                 pyobj2bytes(ordering_account))
-            cipher_ba = encrypt(self.shared_secret_dict[receiver_cid],
+            cipher_ba = encrypt(ba_seed,
                                 pyobj2bytes(beneficiary_account))
             t = (cipher_oa, cipher_ba)
             ret_dict[str(i)] = pyobj2bytes(t)
@@ -643,7 +753,7 @@ class TestSwiftClient(TrainClientTemplate):
 
     def stage2(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
         y_pred = parameters[0]
-        final_preds = pd.Series(y_pred, index=self.df.index)
+        final_preds = pd.Series(y_pred, index=self.index)
         preds_format_df = pd.read_csv(self.preds_format_path, index_col="MessageId")
         preds_format_df["Score"] = preds_format_df.index.map(final_preds)
         preds_format_df["Score"] = preds_format_df["Score"].astype(np.float64)
@@ -657,27 +767,21 @@ class TestBankClient(TrainClientTemplate):
     """Custom Flower NumPyClient class for training."""
 
     def __init__(
-            self, cid: str, df: pd.DataFrame, client_dir: Path
+            self, cid: str, df_pth: Path, client_dir: Path
     ):
-        super().__init__(cid, df, None, client_dir)
+        super().__init__(cid, df_pth, None, client_dir)
         self.weights = np.array(0)
-        pth = client_dir / 'test-account2flag.pkl'
-        if pth.exists():
-            self.account2flag = torch.load(pth)
-        else:
-            self.account2flag = dict(zip(df['Account'], df['Flags'].astype(int)))
-            torch.save(self.account2flag, pth)
-        self.bank_lst = list(df['Bank'].unique())
+        self.account2flag = None
 
     def _get_flag(self, account: str):
         return self.account2flag.setdefault(account, 12)
 
     def setup_round1(self, parameters, config, t: Tuple[List[np.ndarray], int, dict]):
-        t[0].append(np.array([self.cid] + self.bank_lst, dtype=str))
+        df = pd.read_csv(self.df_pth, dtype=pd.StringDtype())
+        self.account2flag = dict(zip(df['Account'], df['Flags'].astype(int)))
+        t[0].append(np.array([self.cid] + list(df['Bank'].unique()), dtype=str))
         if DEBUG:
             logger.info(f'client {self.cid}: upload bank list of size {len(t[0][0]) - 1}')
-        else:
-            logger.info(f'client {self.cid}: upload bank list')
 
     def stage1(self, server_rnd, parameters: List[np.ndarray], config: dict) -> Tuple[List[np.ndarray], int, dict]:
         logger.info(f"Client {self.cid}: reading encrypted batch and computing masked results...")
@@ -699,12 +803,12 @@ class TestBankClient(TrainClientTemplate):
             if (oa := try_decrypt_and_load(key, cipher_oa)) is not None:
                 flg = self._get_flag(oa)
                 ret[i] += self.weights[flg]
-                if DEBUG:
+                if DEBUG and LOGIC_TEST:
                     logger.info(f'BATCH_IDX: {i} ORDERING_ACCOUNT')
             if (ba := try_decrypt_and_load(key, cipher_ba)) is not None:
                 flg = self._get_flag(ba)
                 ret[i] += self.weights[flg + 13]
-                if DEBUG:
+                if DEBUG and LOGIC_TEST:
                     logger.info(f'BATCH_IDX: {i} BENEFICIARY_ACCOUNT')
         ret = quantize([ret], CLIP_RANGE, TARGET_RANGE)[0]
         masked_ret = masking(server_rnd, ret, self.cid, self.shared_seed_dict)
@@ -750,18 +854,16 @@ def test_client_factory(
     """
     if cid == "swift":
         logger.info("Initializing SWIFT client for {}", cid)
-        swift_df = pd.read_csv(data_path, index_col="MessageId")
         return TestSwiftClient(
             cid,
-            df=swift_df,
+            df_pth=data_path,
             client_dir=client_dir,
             preds_format_path=preds_format_path,
             preds_dest_path=preds_dest_path,
         )
     else:
         logger.info("Initializing bank client for {}", cid)
-        bank_df = pd.read_csv(data_path, dtype=pd.StringDtype())
-        return TestBankClient(cid, df=bank_df, client_dir=client_dir)
+        return TestBankClient(cid, df_pth=data_path, client_dir=client_dir)
 
 
 class TestStrategy(fl.server.strategy.Strategy):
@@ -779,13 +881,14 @@ class TestStrategy(fl.server.strategy.Strategy):
         self.preds = np.array(0)
         self.encrypted_batch: Dict[str, bytes] = {}
         self.cached_banklsts = []
+        self.rnd_cnt = 0
         super().__init__()
 
     def initialize_parameters(self, client_manager: ClientManager) -> Parameters:
         """Do nothing. Return empty Flower Parameters dataclass."""
         return empty_parameters()
 
-    def configure_fit(
+    def __configure_round(
             self,
             server_round: int,
             parameters: Parameters,
@@ -846,7 +949,7 @@ class TestStrategy(fl.server.strategy.Strategy):
 
         return ins_lst
 
-    def aggregate_fit(
+    def __aggregate_round(
             self,
             server_round: int,
             results: List[Tuple[ClientProxy, FitRes]],
@@ -909,13 +1012,54 @@ class TestStrategy(fl.server.strategy.Strategy):
         self.stage = (self.stage + 1) % 3
         return None, {}
 
-    def configure_evaluate(self, server_round, parameters, client_manager):
-        """Not running any federated evaluation."""
-        return []
+    def configure_fit(
+            self,
+            server_round: int,
+            parameters: Parameters,
+            client_manager: ClientManager
+    ) -> List[Tuple[ClientProxy, FitIns]]:
+        """Configure the next round of training."""
+        self.rnd_cnt += 1
+        return self.__configure_round(self.rnd_cnt, parameters, client_manager)
 
-    def aggregate_evaluate(self, server_round, results, failures):
-        """Not aggregating any evaluation."""
-        return None
+    def aggregate_fit(
+            self,
+            server_round: int,
+            results: List[Tuple[ClientProxy, FitRes]],
+            failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
+    ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
+        """Aggregate training results."""
+        return self.__aggregate_round(self.rnd_cnt, results, failures)
+
+    def configure_evaluate(
+            self,
+            server_round: int,
+            parameters: Parameters,
+            client_manager: ClientManager
+    ) -> List[Tuple[ClientProxy, EvaluateIns]]:
+        if server_round == 3:
+            logger.info('Test Strategy: skip last eval round!')
+            return []
+        self.rnd_cnt += 1
+        ins_lst = self.__configure_round(self.rnd_cnt, parameters, client_manager)
+        return [(proxy, EvaluateIns(ins.parameters, ins.config)) for proxy, ins in ins_lst]
+
+    def aggregate_evaluate(
+            self,
+            server_round: int,
+            results: List[Tuple[ClientProxy, EvaluateRes]],
+            failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
+    ) -> Tuple[Optional[float], Dict[str, Scalar]]:
+        if server_round == 3:
+            logger.info('Test Strategy: skip last eval round!')
+            return None, {}
+
+        def convert(res: EvaluateRes) -> FitRes:
+            params = bytes2pyobj(res.metrics.pop('parameters'))
+            return FitRes(res.status, params, res.num_examples, res.metrics)
+
+        results = [(proxy, convert(eval_res)) for proxy, eval_res in results]
+        return self.__aggregate_round(self.rnd_cnt, results, failures)
 
     def evaluate(self, server_round, parameters):
         """Not running any centralized evaluation."""
@@ -941,8 +1085,8 @@ def test_strategy_factory(
         (int): Number of federated learning rounds to execute.
     """
     test_strategy = TestStrategy(server_dir=server_dir)
-    # setup rounds = 2
-    # predict rounds = 3 (stage 0, 1, 2)
-    # num_rounds = 2 + 3 = 5
-    num_rounds = 5
+    # setup rounds = 2 / 2 = 1
+    # predict rounds = 3 / 2 = 1.5 (stage 0, 1, 2)
+    # num_rounds = 1 + 1.5 = 2.5
+    num_rounds = 3
     return test_strategy, num_rounds
